@@ -1,0 +1,144 @@
+name: Build unsigned iPhone IPA
+
+on:
+  push:
+    branches: [chore/ios-sideload]
+  # GitHub's manual-run UI requires this file on the default branch.
+  # Bootstrap with a push to chore/ios-sideload; see docs/ios-sideload.md.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-unsigned-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/chore/ios-sideload'
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      CI: '1'
+      EXPO_NO_DOTENV: '1'
+      EXPO_NO_TELEMETRY: '1'
+      NODE_ENV: production
+      EXPECTED_BUNDLE_ID: com.nashlan.blink
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Check toolchain and source hygiene
+        run: |
+          set -euo pipefail
+          # Use the image's maintained default, failing rather than falling back.
+          xcodebuild -version
+          python3 - <<'PY'
+          import subprocess
+          version = subprocess.check_output(['xcodebuild', '-version'], text=True).splitlines()[0].split()[1]
+          parts = tuple(int(x) for x in version.split('.'))
+          if parts < (26, 4):
+              raise SystemExit(f'Xcode >= 26.4 required; found {version}')
+          PY
+          node --version
+          pod --version
+          # Check names only: never print credential or user-data contents.
+          python3 - <<'PY'
+          import pathlib, subprocess
+          files = subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0')
+          blocked = []
+          for name in filter(None, files):
+              p = pathlib.PurePosixPath(name)
+              if ((p.name == '.env' or p.name.startswith('.env.')) and p.name != '.env.example') or p.suffix.lower() in {'.db', '.sqlite', '.sqlite3', '.p8', '.p12', '.pem', '.key', '.mobileprovision', '.ipa'} or p.name.endswith(('.db-wal', '.db-shm', '.sqlite-wal', '.sqlite-shm')) or p.name in {'credentials.json', '.npmrc'}:
+                  blocked.append(name)
+          if blocked:
+              raise SystemExit('Remove sensitive files from Git before building: ' + ', '.join(blocked))
+          PY
+
+      - name: Install locked dependencies and validate
+        run: |
+          set -euo pipefail
+          npm ci --include=dev
+          npx --no-install expo install --check
+          npm run lint
+          npm run typecheck
+
+      - name: Generate iOS project with Expo CNG
+        run: |
+          set -euo pipefail
+          npx --no-install expo prebuild --platform ios --clean --no-install
+          # CNG must retain Expo's production JS and asset bundling phase.
+          grep -q 'export:embed' ios/Blink.xcodeproj/project.pbxproj
+          grep -q 'react-native-xcode.sh' ios/Blink.xcodeproj/project.pbxproj
+          # Prebuild may rewrite start scripts in the disposable checkout.
+          # Dependency or lockfile changes must fail instead of silently upgrading.
+          node - <<'JS'
+          const fs = require('node:fs');
+          const { execFileSync } = require('node:child_process');
+          const assert = require('node:assert/strict');
+          const before = JSON.parse(execFileSync('git', ['show', 'HEAD:package.json'], { encoding: 'utf8' }));
+          const after = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          for (const key of ['dependencies', 'devDependencies', 'optionalDependencies', 'overrides']) {
+            assert.deepEqual(after[key], before[key], `Prebuild changed ${key}`);
+          }
+          JS
+          git diff --exit-code -- package-lock.json app.json
+
+      - name: Install CocoaPods
+        working-directory: ios
+        run: pod install
+
+      - name: Build unsigned Release for physical iPhone
+        run: |
+          set -euo pipefail
+          unset SKIP_BUNDLING
+          export NODE_BINARY="$(command -v node)"
+          xcodebuild \
+            -workspace ios/Blink.xcworkspace \
+            -scheme Blink \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/BlinkDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            DEVELOPMENT_TEAM= \
+            build
+
+      - name: Verify device app, embedded bundle and resources
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-ios-app.py \
+            "$RUNNER_TEMP/BlinkDerivedData/Build/Products/Release-iphoneos" \
+            "$EXPECTED_BUNDLE_ID"
+
+      - name: Package Payload as unsigned IPA
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/BlinkPackage/Payload" build
+          ditto "$RUNNER_TEMP/BlinkDerivedData/Build/Products/Release-iphoneos/Blink.app" \
+            "$RUNNER_TEMP/BlinkPackage/Payload/Blink.app"
+          (cd "$RUNNER_TEMP/BlinkPackage" && zip -qry "$GITHUB_WORKSPACE/build/Blink-unsigned.ipa" Payload)
+          unzip -t build/Blink-unsigned.ipa
+          shasum -a 256 build/Blink-unsigned.ipa
+
+      - name: Upload unsigned IPA (7 days)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Blink-unsigned
+          path: build/Blink-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

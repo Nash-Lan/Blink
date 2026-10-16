@@ -64,3 +64,9 @@ tmp/
 # generated native folders
 /ios
 /android
+
+# unsigned iOS build outputs
+/build/
+*.ipa
+*.xcarchive/
+*.xcresult/
