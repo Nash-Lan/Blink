@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, KeyboardAvoidingView, Modal, Platform, Pressable, StyleSheet, Text, TextInput, View, type NativeSyntheticEvent, type TextInputChangeEventData } from 'react-native';
+import { Alert, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View, type NativeSyntheticEvent, type TextInputChangeEventData } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useBlink } from '../state/BlinkProvider';
+import { formatDateInput, parseLocalDateTimeStrict } from '../domain/datetime';
+import { validateReminderAt } from '../domain/reminders';
 import { endOfLocalDay } from '../domain/time';
 import { usePalette } from '../theme/usePalette';
+import { DateTimeFields, makeReminderDraft, parseReminderDraft, ReminderFields } from './ReminderFields';
 
 type Props = {
   visible: boolean;
@@ -19,6 +22,7 @@ export function QuickCreateSheet({ visible, onClose }: Props) {
   const [text, setText] = useState(data.settings.draftText);
   const [dateText, setDateText] = useState(formatDateInput(new Date()));
   const [timeText, setTimeText] = useState('23:59');
+  const [reminder, setReminder] = useState(() => makeReminderDraft(endOfLocalDay(new Date())));
   const [saving, setSaving] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const inputRef = useRef<TextInput>(null);
@@ -44,11 +48,29 @@ export function QuickCreateSheet({ visible, onClose }: Props) {
   }, [text, mode, saveDraft, visible]);
 
   const canSave = text.trim().length > 0 && !saving;
-  const dueDate = useMemo(() => parseLocalDateTime(dateText, timeText), [dateText, timeText]);
+  const parsedDue = useMemo(() => parseLocalDateTimeStrict(dateText, timeText), [dateText, timeText]);
 
   async function save() {
     if (!canSave) {
       return;
+    }
+    let reminderAt: Date | null = null;
+    if (mode === 'deadline') {
+      if (!parsedDue.ok) {
+        setErrorMessage(parsedDue.message);
+        return;
+      }
+      const parsedReminder = parseReminderDraft(reminder, parsedDue.date);
+      if (!parsedReminder.ok) {
+        setErrorMessage(parsedReminder.message);
+        return;
+      }
+      const validation = validateReminderAt(parsedReminder.date);
+      if (!validation.ok) {
+        setErrorMessage(validation.message);
+        return;
+      }
+      reminderAt = parsedReminder.date;
     }
     setSaving(true);
     setErrorMessage(null);
@@ -57,9 +79,11 @@ export function QuickCreateSheet({ visible, onClose }: Props) {
       if (mode === 'note') {
         await createNote(text.trim(), parseTags(text));
       } else {
-        await createDeadline({ title: text.trim(), dueDate: dueDate ?? endOfLocalDay(new Date()) });
+        if (!parsedDue.ok) return;
+        await createDeadline({ title: text.trim(), dueDate: parsedDue.date, reminderAt });
       }
       setText('');
+      setReminder(makeReminderDraft(endOfLocalDay(new Date())));
       onClose();
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Record could not be saved.';
@@ -83,12 +107,14 @@ export function QuickCreateSheet({ visible, onClose }: Props) {
               <Text style={[styles.saveText, { color: palette.blue }]}>{saving ? 'Saving...' : 'Save'}</Text>
             </Pressable>
           </View>
+          <ScrollView style={styles.scroll} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
           <View style={[styles.segment, { backgroundColor: palette.fill }]}>
             <Segment label="Note" icon="document-text-outline" active={mode === 'note'} onPress={() => setMode('note')} />
             <Segment label="DDL" icon="flag-outline" active={mode === 'deadline'} onPress={() => setMode('deadline')} />
           </View>
           <TextInput
             ref={inputRef}
+            accessibilityLabel={mode === 'note' ? 'Note text' : 'Deadline title'}
             value={text}
             onChangeText={syncText}
             onChange={syncTextEvent}
@@ -98,21 +124,21 @@ export function QuickCreateSheet({ visible, onClose }: Props) {
             style={[styles.input, { color: palette.text, backgroundColor: palette.grouped }]}
           />
           {mode === 'deadline' ? (
-            <View style={styles.dateRow}>
-              <View style={[styles.dateField, { backgroundColor: palette.grouped }]}>
-                <Text style={[styles.fieldLabel, { color: palette.secondaryText }]}>Date</Text>
-                <TextInput value={dateText} onChangeText={setDateText} style={[styles.fieldInput, { color: palette.text }]} placeholder="YYYY-MM-DD" />
-              </View>
-              <View style={[styles.dateField, { backgroundColor: palette.grouped }]}>
-                <Text style={[styles.fieldLabel, { color: palette.secondaryText }]}>Time</Text>
-                <TextInput value={timeText} onChangeText={setTimeText} style={[styles.fieldInput, { color: palette.text }]} placeholder="23:59" />
-              </View>
-            </View>
+            <>
+              <DateTimeFields label="Due" dateText={dateText} timeText={timeText} onDateChange={setDateText} onTimeChange={setTimeText} />
+              <ReminderFields
+                value={reminder}
+                dueAt={parsedDue.ok ? parsedDue.date : null}
+                systemNotificationsEnabled={Platform.OS === 'ios' && data.settings.nativeNotificationsEnabled}
+                onChange={setReminder}
+              />
+            </>
           ) : null}
           {errorMessage ? <Text style={[styles.error, { color: palette.red }]}>{errorMessage}</Text> : null}
           <Text style={[styles.hint, { color: palette.secondaryText }]}>
             {data.settings.aiEnabled ? 'Saved locally first. Visual AI runs after save.' : 'AI is off. Local capture still works.'}
           </Text>
+          </ScrollView>
         </View>
       </KeyboardAvoidingView>
     </Modal>
@@ -134,20 +160,6 @@ function parseTags(value: string): string[] {
   return [...new Set(matches.map((tag) => tag.slice(1)))];
 }
 
-function formatDateInput(date: Date): string {
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-}
-
-function parseLocalDateTime(dateText: string, timeText: string): Date | null {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateText.trim());
-  const time = /^(\d{1,2}):(\d{2})$/.exec(timeText.trim());
-  if (!match || !time) {
-    return null;
-  }
-  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(time[1]), Number(time[2]), 0, 0);
-  return Number.isNaN(date.getTime()) ? null : date;
-}
-
 const styles = StyleSheet.create({
   scrim: {
     ...StyleSheet.absoluteFill,
@@ -158,13 +170,15 @@ const styles = StyleSheet.create({
     justifyContent: 'flex-end',
   },
   sheet: {
+    maxHeight: '92%',
     borderTopLeftRadius: 22,
     borderTopRightRadius: 22,
     paddingHorizontal: 18,
     paddingTop: 10,
-    paddingBottom: 28,
     gap: 14,
   },
+  scroll: { flexGrow: 0 },
+  content: { gap: 14, paddingBottom: 28 },
   handle: {
     alignSelf: 'center',
     width: 38,
@@ -217,24 +231,6 @@ const styles = StyleSheet.create({
     fontSize: 17,
     lineHeight: 24,
     textAlignVertical: 'top',
-  },
-  dateRow: {
-    flexDirection: 'row',
-    gap: 12,
-  },
-  dateField: {
-    flex: 1,
-    borderRadius: 14,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-  },
-  fieldLabel: {
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  fieldInput: {
-    fontSize: 17,
-    paddingVertical: 4,
   },
   hint: {
     fontSize: 13,

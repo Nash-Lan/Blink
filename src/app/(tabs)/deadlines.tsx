@@ -1,4 +1,5 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useLocalSearchParams } from 'expo-router';
 import type { Deadline } from '../../domain/schema';
 import { bucketDeadline, sortDeadlines } from '../../domain/time';
 import { EditRecordSheet } from '../../components/EditRecordSheet';
@@ -9,13 +10,21 @@ import { useBlink } from '../../state/BlinkProvider';
 
 export default function DeadlinesScreen() {
   const { deadlines, visualFor, toggleDeadline, deleteDeadline } = useBlink();
+  const { deadlineId, notificationId } = useLocalSearchParams<{ deadlineId?: string; notificationId?: string }>();
   const [editing, setEditing] = useState<Deadline | null>(null);
+  const consumedNotificationRef = useRef<string | null>(null);
   const groups = useMemo(() => ({
     overdue: deadlines.filter((item) => bucketDeadline(item) === 'overdue').sort(sortDeadlines),
     today: deadlines.filter((item) => bucketDeadline(item) === 'today').sort(sortDeadlines),
     future: deadlines.filter((item) => bucketDeadline(item) === 'future').sort(sortDeadlines),
     completed: deadlines.filter((item) => bucketDeadline(item) === 'completed').sort(sortDeadlines),
   }), [deadlines]);
+
+  useEffect(() => {
+    if (!notificationId || consumedNotificationRef.current === notificationId) return;
+    consumedNotificationRef.current = notificationId;
+    setEditing(deadlines.find((item) => item.id === deadlineId) ?? null);
+  }, [deadlineId, deadlines, notificationId]);
 
   return (
     <Screen title="Deadlines" subtitle={`${deadlines.length} tasks`}>

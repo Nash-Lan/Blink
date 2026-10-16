@@ -1,1 +1,1 @@
-export { storage } from './index.native';
+export { notificationBindingStore, storage } from './index.native';

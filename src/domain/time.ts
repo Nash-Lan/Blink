@@ -42,3 +42,13 @@ export function remainingLabel(deadline: Deadline, now = new Date()): string {
 export function sortDeadlines(a: Deadline, b: Deadline): number {
   return new Date(a.dueAt).getTime() - new Date(b.dueAt).getTime();
 }
+
+export function isWithinNextDays(date: Date, now = new Date(), days = 7): boolean {
+  const start = new Date(now);
+  start.setHours(23, 59, 59, 999);
+  const end = new Date(now);
+  end.setDate(end.getDate() + days);
+  end.setHours(23, 59, 59, 999);
+  const value = date.getTime();
+  return value > start.getTime() && value <= end.getTime();
+}

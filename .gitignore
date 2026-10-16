@@ -5,6 +5,10 @@ node_modules/
 
 # local tool settings
 .claude/
+.codex/
+.agents/
+.vscode/
+.idea/
 
 # no project license has been selected yet
 /LICENSE
@@ -28,13 +32,22 @@ expo-env.d.ts
 .metro-health-check*
 
 # debug
+*.log
 npm-debug.*
 yarn-debug.*
 yarn-error.*
 expo-web*.log
 test-results/
 playwright-report/
+coverage/
 tmp/
+
+# local databases
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
 
 # macOS
 .DS_Store

@@ -102,6 +102,15 @@ export const aiJobSchema = z.object({
 });
 export type AIJob = z.infer<typeof aiJobSchema>;
 
+export const reminderHistoryItemSchema = z.object({
+  key: z.string(),
+  deadlineId: z.string(),
+  dueAt: z.string(),
+  reminderAt: z.string(),
+  shownAt: z.string(),
+});
+export type ReminderHistoryItem = z.infer<typeof reminderHistoryItemSchema>;
+
 export const aiCacheItemSchema = z.object({
   id: z.string(),
   recordType: z.enum(['note', 'deadline']),
@@ -124,6 +133,7 @@ export const aiCacheItemSchema = z.object({
 export type AICacheItem = z.infer<typeof aiCacheItemSchema>;
 
 export const settingsSchema = z.object({
+  nativeNotificationsEnabled: z.boolean().default(false),
   aiEnabled: z.boolean().default(false),
   aiMockMode: z.boolean().default(true),
   deepSeekModel: z.string().default('deepseek-flash'),
@@ -142,6 +152,7 @@ export const appDataSchema = z.object({
   visualAssets: z.array(visualAssetSchema),
   aiJobs: z.array(aiJobSchema),
   aiCache: z.array(aiCacheItemSchema).default([]),
+  reminderHistory: z.array(reminderHistoryItemSchema).default([]),
   settings: settingsSchema,
 });
 export type AppData = z.infer<typeof appDataSchema>;
@@ -159,7 +170,9 @@ export function defaultAppData(): AppData {
     visualAssets: [],
     aiJobs: [],
     aiCache: [],
+    reminderHistory: [],
     settings: {
+      nativeNotificationsEnabled: false,
       aiEnabled: false,
       aiMockMode: true,
       deepSeekModel: 'deepseek-flash',

@@ -3,6 +3,8 @@ import { StatusBar } from 'expo-status-bar';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { BlinkProvider } from '../state/BlinkProvider';
 import { usePalette } from '../theme/usePalette';
+import { InAppReminderBanner } from '../components/InAppReminderBanner';
+import { NativeNotificationBridge } from '../notifications/NativeNotificationBridge';
 
 export default function RootLayout() {
   const palette = usePalette();
@@ -15,6 +17,8 @@ export default function RootLayout() {
           <Stack.Screen name="settings" options={{ presentation: 'modal' }} />
           <Stack.Screen name="note/[id]" />
         </Stack>
+        <InAppReminderBanner />
+        <NativeNotificationBridge />
       </BlinkProvider>
     </GestureHandlerRootView>
   );

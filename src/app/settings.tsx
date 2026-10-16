@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Alert, Platform, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from 'react-native';
+import { Alert, Linking, Platform, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from 'react-native';
 import { router } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
@@ -8,7 +8,17 @@ import { usePalette } from '../theme/usePalette';
 
 export default function SettingsScreen() {
   const palette = usePalette();
-  const { data, updateSettings, backup, restore } = useBlink();
+  const {
+    data,
+    nativeNotificationPermission,
+    nativeNotificationSyncing,
+    nativeNotificationError,
+    setNativeNotificationsEnabled,
+    reconcileNativeNotifications,
+    updateSettings,
+    backup,
+    restore,
+  } = useBlink();
   const [restoreText, setRestoreText] = useState('');
   const [backupText, setBackupText] = useState('');
   const [showPrivacy, setShowPrivacy] = useState(false);
@@ -33,6 +43,29 @@ export default function SettingsScreen() {
         <View style={{ width: 26 }} />
       </View>
       <ScrollView contentContainerStyle={styles.content}>
+        <View style={[styles.group, { backgroundColor: palette.card }]}>
+          <SettingRow
+            title="System notifications"
+            body={notificationStatusText(nativeNotificationPermission, nativeNotificationSyncing, nativeNotificationError)}
+            value={data.settings.nativeNotificationsEnabled}
+            disabled={nativeNotificationPermission === 'unsupported'}
+            onValueChange={(enabled) => {
+              void setNativeNotificationsEnabled(enabled).catch((error) => {
+                Alert.alert('Notification update failed', error instanceof Error ? error.message : 'Please try again.');
+              });
+            }}
+          />
+          {nativeNotificationError ? (
+            <Pressable style={[styles.action, { backgroundColor: palette.fill }]} onPress={() => void reconcileNativeNotifications()}>
+              <Text style={[styles.actionText, { color: palette.blue }]}>Retry notification sync</Text>
+            </Pressable>
+          ) : null}
+          {Platform.OS === 'ios' && nativeNotificationPermission === 'denied' ? (
+            <Pressable style={[styles.action, { backgroundColor: palette.fill }]} onPress={() => void Linking.openSettings()}>
+              <Text style={[styles.actionText, { color: palette.blue }]}>Open iOS Settings</Text>
+            </Pressable>
+          ) : null}
+        </View>
         <View style={[styles.group, { backgroundColor: palette.card }]}>
           <SettingRow
             title="Visual AI"
@@ -92,7 +125,7 @@ export default function SettingsScreen() {
   );
 }
 
-function SettingRow({ title, body, value, onValueChange }: { title: string; body: string; value: boolean; onValueChange(value: boolean): void }) {
+function SettingRow({ title, body, value, disabled = false, onValueChange }: { title: string; body: string; value: boolean; disabled?: boolean; onValueChange(value: boolean): void }) {
   const palette = usePalette();
   return (
     <View style={[styles.settingRow, { borderBottomColor: palette.separator }]}>
@@ -100,9 +133,22 @@ function SettingRow({ title, body, value, onValueChange }: { title: string; body
         <Text style={[styles.label, { color: palette.text }]}>{title}</Text>
         <Text style={[styles.body, { color: palette.secondaryText }]}>{body}</Text>
       </View>
-      <Switch value={value} onValueChange={onValueChange} />
+      <Switch value={value} disabled={disabled} onValueChange={onValueChange} />
     </View>
   );
+}
+
+function notificationStatusText(permission: string, syncing: boolean, error: string | null): string {
+  if (error) return `Sync needs attention: ${error}`;
+  if (syncing) return 'Checking scheduled reminders…';
+  switch (permission) {
+    case 'granted': return 'Allowed. Future reminders are scheduled on this iPhone.';
+    case 'provisional': return 'Provisionally allowed. iOS may deliver reminders quietly.';
+    case 'ephemeral': return 'Temporarily allowed by iOS.';
+    case 'denied': return 'Denied in iOS Settings. In-app reminder banners still work.';
+    case 'undetermined': return 'Off. Permission is requested only when you enable this switch.';
+    default: return 'Unavailable on this platform. In-app reminder banners still work.';
+  }
 }
 
 const styles = StyleSheet.create({

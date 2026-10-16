@@ -1,13 +1,19 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type PropsWithChildren } from 'react';
-import { Alert, Platform } from 'react-native';
+import { Alert, AppState, Platform } from 'react-native';
 import * as Haptics from 'expo-haptics';
 import { ZodError } from 'zod';
 import { aiRequest } from '../ai/request';
 import { applyCachedIconResult, applyVisualResult, enqueueAIJob, failAIJob, hideVisualAsset, makeId, markAIJobProcessing, recoverInterruptedAIJobs, requestRegenerateVisual, runMockAIJobs, updateMermaidVisual } from '../domain/ai';
 import { defaultAppData, type AppData, type Deadline, type Note, type Settings, type VisualAsset } from '../domain/schema';
+import { findDueReminder, markReminderShown, nextReminderDelay, reminderKey, resolveActiveReminder, validateReminderAt, type ReminderEvent } from '../domain/reminders';
 import { endOfLocalDay } from '../domain/time';
 import { exportBackup, importBackup } from '../storage/backup';
-import { storage } from '../storage';
+import { notificationBindingStore, storage } from '../storage';
+import { nativeNotificationAdapter } from '../notifications/adapter';
+import { NativeNotificationCoordinator } from '../notifications/coordinator';
+import { permissionForExplicitEnable } from '../notifications/permissions';
+import type { NativeNotificationPermission } from '../notifications/types';
+import { persistThenPublish, SerialTaskQueue, StorageLoadBarrier } from './commitQueue';
 
 type CreateDeadlineInput = {
   title: string;
@@ -21,6 +27,10 @@ type BlinkContextValue = {
   notes: Note[];
   deadlines: Deadline[];
   lastCompletedDeadline: Pick<Deadline, 'id' | 'title' | 'completedAt'> | null;
+  activeReminder: ReminderEvent | null;
+  nativeNotificationPermission: NativeNotificationPermission;
+  nativeNotificationSyncing: boolean;
+  nativeNotificationError: string | null;
   visualFor(recordId: string): VisualAsset | undefined;
   saveDraft(text: string, mode: Settings['draftMode']): void;
   createNote(body: string, tags?: string[]): Promise<void>;
@@ -31,6 +41,10 @@ type BlinkContextValue = {
   toggleDeadline(id: string): Promise<void>;
   undoLastCompletedDeadline(): Promise<void>;
   deleteDeadline(id: string): Promise<void>;
+  dismissActiveReminder(): void;
+  acknowledgeNativeReminder(deadlineId: string, expectedReminderKey: string): Promise<void>;
+  setNativeNotificationsEnabled(enabled: boolean): Promise<void>;
+  reconcileNativeNotifications(): Promise<void>;
   updateSettings(patch: Partial<Settings>): Promise<void>;
   saveMermaidVisual(visualId: string, definition: string): Promise<void>;
   hideVisual(visualId: string): Promise<void>;
@@ -45,51 +59,119 @@ export function BlinkProvider({ children }: PropsWithChildren) {
   const [data, setData] = useState<AppData>(defaultAppData);
   const [ready, setReady] = useState(false);
   const [retryTick, setRetryTick] = useState(0);
+  const [reminderTick, setReminderTick] = useState(0);
+  const [appState, setAppState] = useState(AppState.currentState ?? 'active');
+  const [nativeNotificationPermission, setNativeNotificationPermission] = useState<NativeNotificationPermission>(nativeNotificationAdapter.supported ? 'undetermined' : 'unsupported');
+  const [nativeNotificationSyncing, setNativeNotificationSyncing] = useState(false);
+  const [nativeNotificationError, setNativeNotificationError] = useState<string | null>(null);
   const [lastCompletedDeadline, setLastCompletedDeadline] = useState<Pick<Deadline, 'id' | 'title' | 'completedAt'> | null>(null);
+  const [reminderCandidate, setReminderCandidate] = useState<ReminderEvent | null>(null);
+  // Validity follows the current deadline, so edits/completion never leave a stale banner for a frame.
+  const activeReminder = useMemo(() => resolveActiveReminder(reminderCandidate, data.deadlines), [reminderCandidate, data.deadlines]);
   const dataRef = useRef<AppData>(defaultAppData());
-  const commitQueueRef = useRef(Promise.resolve());
+  const [storageLoadBarrier] = useState(() => new StorageLoadBarrier());
+  const hydrationStartedRef = useRef(false);
+  const commitQueueRef = useRef(new SerialTaskQueue());
   const processingAIJobsRef = useRef(new Set<string>());
+  const processingReminderRef = useRef<string | null>(null);
+  const reminderRetryAfterRef = useRef(0);
+  const mountedRef = useRef(false);
+  const [nativeNotificationCoordinator] = useState(() => new NativeNotificationCoordinator(
+    nativeNotificationAdapter,
+    notificationBindingStore,
+  ));
+
+  const reconcileNativeNotifications = useCallback(async () => {
+    if (!nativeNotificationCoordinator.supported) {
+      setNativeNotificationPermission('unsupported');
+      return;
+    }
+    try {
+      // Never reconcile from the in-memory defaults when the persisted app snapshot
+      // could not be read: doing so could cancel valid device notifications.
+      await storageLoadBarrier.wait();
+      setNativeNotificationSyncing(true);
+      const permission = await nativeNotificationCoordinator.reconcileAll();
+      if (mountedRef.current) {
+        setNativeNotificationPermission(permission);
+        setNativeNotificationError(null);
+      }
+    } catch (error) {
+      if (mountedRef.current) {
+        setNativeNotificationError(error instanceof Error ? error.message : 'Native notification sync failed.');
+      }
+    } finally {
+      if (mountedRef.current) setNativeNotificationSyncing(false);
+    }
+  }, [nativeNotificationCoordinator, storageLoadBarrier]);
 
   useEffect(() => {
-    let mounted = true;
-    storage.load()
-      .then((loaded) => {
-        if (mounted && loaded) {
-          const hydrated = runMockAIJobs(recoverInterruptedAIJobs(loaded));
-          dataRef.current = hydrated;
-          setData(hydrated);
-          debugLog('storage.load.success', { notes: hydrated.notes.length, deadlines: hydrated.deadlines.length });
-        }
-      })
-      .catch((error) => {
-        debugLog('storage.load.failed', { message: error instanceof Error ? error.message : 'Unknown error' });
-        if (Platform.OS !== 'web') {
-          Alert.alert('Storage unavailable', 'Blink will keep running, but persistence needs attention.');
-        }
-      })
-      .finally(() => {
-        if (mounted) {
-          setReady(true);
-        }
-      });
+    mountedRef.current = true;
+    nativeNotificationCoordinator.configureForegroundHandler();
+    if (!hydrationStartedRef.current) {
+      hydrationStartedRef.current = true;
+      storage.load()
+        .then((loaded) => {
+          if (mountedRef.current && loaded) {
+            const hydrated = runMockAIJobs(recoverInterruptedAIJobs(loaded));
+            dataRef.current = hydrated;
+            nativeNotificationCoordinator.updatePlan(hydrated.deadlines, hydrated.settings.nativeNotificationsEnabled);
+            setData(hydrated);
+            debugLog('storage.load.success', { notes: hydrated.notes.length, deadlines: hydrated.deadlines.length });
+          }
+        })
+        .catch((error) => {
+          storageLoadBarrier.fail(error);
+          debugLog('storage.load.failed', { message: error instanceof Error ? error.message : 'Unknown error' });
+          if (mountedRef.current && Platform.OS !== 'web') {
+            Alert.alert('Storage unavailable', 'Blink will keep running, but persistence needs attention.');
+          }
+        })
+        .finally(() => {
+          storageLoadBarrier.complete();
+          if (mountedRef.current) {
+            setReady(true);
+          }
+        });
+    }
     return () => {
-      mounted = false;
+      mountedRef.current = false;
     };
-  }, []);
+  }, [nativeNotificationCoordinator, storageLoadBarrier]);
 
   const commit = useCallback(async (label: string, producer: (current: AppData) => AppData) => {
-    const run = commitQueueRef.current.then(async () => {
-      const nextData = runMockAIJobs(producer(dataRef.current));
-      debugLog(`${label}.validated`, { notes: nextData.notes.length, deadlines: nextData.deadlines.length, jobs: nextData.aiJobs.length });
-      await storage.save(nextData);
-      debugLog(`${label}.persisted`, { notes: nextData.notes.length, deadlines: nextData.deadlines.length });
-      dataRef.current = nextData;
-      setData(nextData);
-      debugLog(`${label}.state-updated`, { notes: nextData.notes.length, deadlines: nextData.deadlines.length });
+    return commitQueueRef.current.enqueue(async () => {
+      await storageLoadBarrier.wait();
+      return persistThenPublish({
+        getCurrent: () => dataRef.current,
+        produce: (current) => {
+          const nextData = runMockAIJobs(producer(current));
+          debugLog(`${label}.validated`, { notes: nextData.notes.length, deadlines: nextData.deadlines.length, jobs: nextData.aiJobs.length });
+          return nextData;
+        },
+        save: async (nextData) => {
+          await storage.save(nextData);
+          debugLog(`${label}.persisted`, { notes: nextData.notes.length, deadlines: nextData.deadlines.length });
+        },
+        publish: (nextData) => {
+          const notificationPlanChanged = nativeNotificationPlanKey(dataRef.current) !== nativeNotificationPlanKey(nextData);
+          dataRef.current = nextData;
+          nativeNotificationCoordinator.updatePlan(nextData.deadlines, nextData.settings.nativeNotificationsEnabled);
+          setData(nextData);
+          // Clear invalid candidates as part of the mutation, so Undo cannot revive an old banner.
+          setReminderCandidate((current) => resolveActiveReminder(current, nextData.deadlines));
+          debugLog(`${label}.state-updated`, { notes: nextData.notes.length, deadlines: nextData.deadlines.length });
+          if (notificationPlanChanged) void reconcileNativeNotifications();
+        },
+      });
     });
-    commitQueueRef.current = run.catch(() => undefined);
-    await run;
-  }, []);
+  }, [nativeNotificationCoordinator, reconcileNativeNotifications, storageLoadBarrier]);
+
+  useEffect(() => {
+    if (!ready || appState !== 'active') return undefined;
+    const timeout = setTimeout(() => void reconcileNativeNotifications(), 0);
+    return () => clearTimeout(timeout);
+  }, [ready, appState, reconcileNativeNotifications]);
 
   useEffect(() => {
     if (!ready || !data.settings.aiEnabled || data.settings.aiMockMode || !data.settings.aiConsentGranted) {
@@ -98,6 +180,60 @@ export function BlinkProvider({ children }: PropsWithChildren) {
     const interval = setInterval(() => setRetryTick((value) => value + 1), 2000);
     return () => clearInterval(interval);
   }, [ready, data.settings.aiEnabled, data.settings.aiMockMode, data.settings.aiConsentGranted]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', setAppState);
+    return () => subscription.remove();
+  }, []);
+
+  useEffect(() => {
+    if (!ready || appState !== 'active' || activeReminder || processingReminderRef.current) {
+      return;
+    }
+    const delay = nextReminderDelay(data.deadlines, data.reminderHistory);
+    if (delay === null) {
+      return;
+    }
+    // Wake at the due time; cap long waits to detect wall-clock changes while foregrounded.
+    const wait = Math.max(Math.min(delay, 15_000), reminderRetryAfterRef.current - Date.now());
+    const timeout = setTimeout(() => {
+      if (AppState.currentState !== 'active' || processingReminderRef.current) {
+        return;
+      }
+      const event = findDueReminder(dataRef.current.deadlines, dataRef.current.reminderHistory);
+      if (!event) {
+        setReminderTick((value) => value + 1);
+        return;
+      }
+      processingReminderRef.current = event.key;
+      let claimed = false;
+      void commit('reminder.show', (current) => {
+        // Recheck inside the serialized write: an edit may have been queued before this check.
+        if (AppState.currentState !== 'active') {
+          return current;
+        }
+        const next = markReminderShown(current, event);
+        claimed = next !== current;
+        return next;
+      })
+        .then(() => {
+          if (claimed && mountedRef.current) {
+            setReminderCandidate(resolveActiveReminder(event, dataRef.current.deadlines));
+          }
+        })
+        .catch((error) => {
+          reminderRetryAfterRef.current = Date.now() + 15_000;
+          debugLog('reminder.show.failed', { message: error instanceof Error ? error.message : 'Reminder could not be saved.' });
+        })
+        .finally(() => {
+          processingReminderRef.current = null;
+          if (mountedRef.current) {
+            setReminderTick((value) => value + 1);
+          }
+        });
+    }, wait);
+    return () => clearTimeout(timeout);
+  }, [ready, appState, activeReminder, data.deadlines, data.reminderHistory, reminderTick, commit]);
 
   useEffect(() => {
     if (!ready || !data.settings.aiEnabled || data.settings.aiMockMode || !data.settings.aiConsentGranted) {
@@ -201,6 +337,13 @@ export function BlinkProvider({ children }: PropsWithChildren) {
   const createDeadline = useCallback(async (input: CreateDeadlineInput) => {
     const now = new Date().toISOString();
     const due = input.dueDate ? new Date(input.dueDate) : endOfLocalDay(new Date());
+    if (!Number.isFinite(due.getTime())) {
+      throw new Error('Enter a valid deadline date and time.');
+    }
+    const reminderValidation = validateReminderAt(input.reminderAt ?? null);
+    if (!reminderValidation.ok) {
+      throw new Error(reminderValidation.message);
+    }
     const deadline: Deadline = {
       id: makeId('ddl'),
       title: input.title.trim(),
@@ -224,6 +367,18 @@ export function BlinkProvider({ children }: PropsWithChildren) {
         if (item.id !== id) {
           return item;
         }
+        const dueAt = patch.dueAt ?? item.dueAt;
+        if (!Number.isFinite(new Date(dueAt).getTime())) {
+          throw new Error('Enter a valid deadline date and time.');
+        }
+        const reminderAt = patch.reminderAt === undefined ? item.reminderAt : patch.reminderAt;
+        const reminderValidation = validateReminderAt(reminderAt === null ? null : new Date(reminderAt), {
+          previousReminderAt: item.reminderAt,
+          preserveExisting: dueAt === item.dueAt,
+        });
+        if (!reminderValidation.ok) {
+          throw new Error(reminderValidation.message);
+        }
         const contentChanged = patch.title !== undefined || patch.notes !== undefined || patch.dueAt !== undefined;
         return { ...item, ...patch, updatedAt: new Date().toISOString(), contentVersion: contentChanged ? item.contentVersion + 1 : item.contentVersion };
       });
@@ -237,13 +392,14 @@ export function BlinkProvider({ children }: PropsWithChildren) {
   }, [commit]);
 
   const toggleDeadline = useCallback(async (id: string) => {
-    const deadline = dataRef.current.deadlines.find((item) => item.id === id);
-    const isCompleting = Boolean(deadline && !deadline.completedAt);
-    await commit('deadline.toggle', (current) => ({
+    const nextData = await commit('deadline.toggle', (current) => ({
       ...current,
       deadlines: current.deadlines.map((item) => item.id === id ? { ...item, completedAt: item.completedAt ? null : new Date().toISOString(), updatedAt: new Date().toISOString() } : item),
     }));
-    setLastCompletedDeadline(isCompleting && deadline ? { id: deadline.id, title: deadline.title, completedAt: new Date().toISOString() } : null);
+    const deadline = nextData.deadlines.find((item) => item.id === id);
+    setLastCompletedDeadline(deadline?.completedAt
+      ? { id: deadline.id, title: deadline.title, completedAt: deadline.completedAt }
+      : null);
     feedback();
   }, [commit, feedback]);
 
@@ -270,6 +426,35 @@ export function BlinkProvider({ children }: PropsWithChildren) {
     setLastCompletedDeadline((current) => current?.id === id ? null : current);
   }, [commit]);
 
+  const dismissActiveReminder = useCallback(() => {
+    setReminderCandidate(null);
+  }, []);
+
+  const acknowledgeNativeReminder = useCallback(async (deadlineId: string, expectedReminderKey: string) => {
+    await commit('reminder.native-response', (current) => {
+      const deadline = current.deadlines.find((item) => item.id === deadlineId);
+      if (!deadline || !deadline.reminderAt || reminderKey(deadline) !== expectedReminderKey) return current;
+      return markReminderShown(current, {
+        key: expectedReminderKey,
+        deadlineId,
+        title: deadline.title,
+        dueAt: deadline.dueAt,
+        reminderAt: deadline.reminderAt,
+      });
+    });
+  }, [commit]);
+
+  const setNativeNotificationsEnabled = useCallback(async (enabled: boolean) => {
+    if (enabled && nativeNotificationCoordinator.supported) {
+      const permission = await permissionForExplicitEnable(nativeNotificationCoordinator);
+      setNativeNotificationPermission(permission);
+    }
+    await commit('settings.native-notifications', (current) => ({
+      ...current,
+      settings: { ...current.settings, nativeNotificationsEnabled: enabled },
+    }));
+  }, [commit, nativeNotificationCoordinator]);
+
   const updateSettings = useCallback(async (patch: Partial<Settings>) => {
     await commit('settings.update', (current) => ({ ...current, settings: { ...current.settings, ...patch } }));
   }, [commit]);
@@ -292,11 +477,10 @@ export function BlinkProvider({ children }: PropsWithChildren) {
 
   const restore = useCallback(async (raw: string) => {
     const restored = importBackup(raw);
-    await storage.save(restored);
-    dataRef.current = restored;
-    setData(restored);
+    await commit('backup.restore', () => restored);
+    setReminderCandidate(null);
     setLastCompletedDeadline(null);
-  }, []);
+  }, [commit]);
 
   const value = useMemo<BlinkContextValue>(() => ({
     data,
@@ -304,6 +488,10 @@ export function BlinkProvider({ children }: PropsWithChildren) {
     notes: [...data.notes].sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()),
     deadlines: data.deadlines,
     lastCompletedDeadline,
+    activeReminder: appState === 'active' ? activeReminder : null,
+    nativeNotificationPermission,
+    nativeNotificationSyncing,
+    nativeNotificationError,
     visualFor: (recordId) => data.visualAssets.find((asset) => asset.recordId === recordId && !asset.hidden),
     saveDraft,
     createNote,
@@ -314,13 +502,17 @@ export function BlinkProvider({ children }: PropsWithChildren) {
     toggleDeadline,
     undoLastCompletedDeadline,
     deleteDeadline,
+    dismissActiveReminder,
+    acknowledgeNativeReminder,
+    setNativeNotificationsEnabled,
+    reconcileNativeNotifications,
     updateSettings,
     saveMermaidVisual,
     hideVisual,
     regenerateVisual,
     backup: () => exportBackup(data),
     restore,
-  }), [data, ready, lastCompletedDeadline, saveDraft, createNote, updateNote, deleteNote, createDeadline, updateDeadline, toggleDeadline, undoLastCompletedDeadline, deleteDeadline, updateSettings, saveMermaidVisual, hideVisual, regenerateVisual, restore]);
+  }), [data, ready, appState, lastCompletedDeadline, activeReminder, nativeNotificationPermission, nativeNotificationSyncing, nativeNotificationError, saveDraft, createNote, updateNote, deleteNote, createDeadline, updateDeadline, toggleDeadline, undoLastCompletedDeadline, deleteDeadline, dismissActiveReminder, acknowledgeNativeReminder, setNativeNotificationsEnabled, reconcileNativeNotifications, updateSettings, saveMermaidVisual, hideVisual, regenerateVisual, restore]);
 
   return <BlinkContext.Provider value={value}>{children}</BlinkContext.Provider>;
 }
@@ -335,6 +527,13 @@ export function useBlink() {
 
 function firstLine(value: string): string {
   return value.trim().split(/\r?\n/)[0]?.slice(0, 80) || 'Untitled';
+}
+
+function nativeNotificationPlanKey(data: AppData): string {
+  return JSON.stringify([
+    data.settings.nativeNotificationsEnabled,
+    data.deadlines.map(({ id, title, dueAt, reminderAt, completedAt }) => [id, title, dueAt, reminderAt, completedAt]),
+  ]);
 }
 
 function debugLog(event: string, details: Record<string, unknown>) {

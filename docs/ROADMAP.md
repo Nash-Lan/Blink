@@ -27,7 +27,11 @@
 
 ## Phase 3 - Completeness
 
-- [ ] Reminder scheduling abstraction.
+- [x] Foreground reminder scheduling using the existing Provider and persisted history (v0.2.0 Phase 1).
+- [x] Reminder creation/editing, strict date/time inputs, presets, custom times, and removal.
+- [x] Deterministic reminder domain and browser regression coverage; see [reminder behavior and next steps](./REMINDERS.md).
+- [x] Native notification scheduling, permissions, cancellation, reconciliation, and automated adapter tests.
+- [ ] Verify native notifications and SQLite on a signed iPhone development build.
 - [x] Undo UI for completed deadlines.
 - [x] Add automated tests for save, Visual AI, Mermaid validation, editing, stale results, refresh, and offline behavior.
 - [ ] Accessibility and reduced-motion pass on devices.

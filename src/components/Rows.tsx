@@ -47,7 +47,7 @@ export function DeadlineRow({ deadline, visual, onEdit, onToggle, onDelete }: De
   const done = Boolean(deadline.completedAt);
   return (
     <View style={[styles.row, { backgroundColor: palette.card, opacity: done ? 0.62 : 1 }]}>
-      <Pressable accessibilityRole="checkbox" accessibilityLabel={`${done ? 'Reopen' : 'Complete'} deadline ${deadline.title}`} accessibilityState={{ checked: done }} onPress={onToggle} hitSlop={10}>
+      <Pressable accessibilityRole="checkbox" accessibilityLabel={`${done ? 'Reopen' : 'Complete'} deadline ${deadline.title}`} accessibilityState={{ checked: done }} aria-checked={done} onPress={onToggle} hitSlop={10}>
         <Ionicons name={done ? 'checkmark-circle' : 'ellipse-outline'} size={26} color={done ? palette.green : palette.secondaryText} />
       </Pressable>
       <View style={styles.rowMain}>

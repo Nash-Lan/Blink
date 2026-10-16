@@ -1,6 +1,7 @@
 import { openDB } from 'idb';
-import { appDataSchema, type AppData } from '../domain/schema';
-import type { StorageAdapter } from './types';
+import type { AppData } from '../domain/schema';
+import { parseAppSnapshot } from './snapshot';
+import type { NotificationBindingStore, StorageAdapter } from './types';
 
 const DB_NAME = 'blink-local';
 const STORE_NAME = 'snapshots';
@@ -22,17 +23,22 @@ export const storage: StorageAdapter = {
       debugLog('indexeddb.load.empty');
       return null;
     }
-    const parsed = appDataSchema.parse(raw);
+    const parsed = parseAppSnapshot(raw);
     debugLog('indexeddb.load.success', { notes: parsed.notes.length, deadlines: parsed.deadlines.length });
     return parsed;
   },
   async save(data: AppData) {
     const db = await database();
-    const parsed = appDataSchema.parse(data);
+    const parsed = parseAppSnapshot(data);
     debugLog('indexeddb.save.validated', { notes: parsed.notes.length, deadlines: parsed.deadlines.length });
     await db.put(STORE_NAME, parsed, DATA_KEY);
     debugLog('indexeddb.save.success', { notes: parsed.notes.length, deadlines: parsed.deadlines.length });
   },
+};
+
+export const notificationBindingStore: NotificationBindingStore = {
+  async load() { return []; },
+  async save() {},
 };
 
 function debugLog(event: string, details: Record<string, unknown> = {}) {
